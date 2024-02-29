@@ -73,6 +73,16 @@ impl<'a, M: RawMutex, T> Channel<'a, M, T> {
     pub fn split(&mut self) -> (Sender<'_, M, T>, Receiver<'_, M, T>) {
         (Sender { channel: self }, Receiver { channel: self })
     }
+
+    /// Get a sender for this channel.
+    pub fn sender(&self) -> Sender<'_, M, T> {
+        Sender { channel: self }
+    }
+
+    /// Get a receiver for this channel.
+    pub fn receiver(&self) -> Receiver<'_, M, T> {
+        Receiver { channel: self }
+    }
 }
 
 /// Send-only access to a [`Channel`].
@@ -80,12 +90,15 @@ pub struct Sender<'a, M: RawMutex, T> {
     channel: &'a Channel<'a, M, T>,
 }
 
-impl<'a, M: RawMutex, T> Sender<'a, M, T> {
-    /// Creates one further [`Sender`] over the same channel.
-    pub fn borrow(&mut self) -> Sender<'_, M, T> {
+impl<'a, M: RawMutex, T> Clone for Sender<'a, M, T> {
+    fn clone(&self) -> Self {
         Sender { channel: self.channel }
     }
+}
 
+impl<'ch, M, T> Copy for Sender<'ch, M, T> where M: RawMutex {}
+
+impl<'a, M: RawMutex, T> Sender<'a, M, T> {
     /// Attempts to send a value over the channel.
     pub fn try_send(&mut self) -> Option<&mut T> {
         self.channel.state.lock(|s| {
@@ -140,11 +153,15 @@ pub struct Receiver<'a, M: RawMutex, T> {
     channel: &'a Channel<'a, M, T>,
 }
 
-impl<'a, M: RawMutex, T> Receiver<'a, M, T> {
-    /// Creates one further [`Sender`] over the same channel.
-    pub fn borrow(&mut self) -> Receiver<'_, M, T> {
+impl<'a, M: RawMutex, T> Clone for Receiver<'a, M, T> {
+    fn clone(&self) -> Self {
         Receiver { channel: self.channel }
     }
+}
+
+impl<'ch, M, T> Copy for Receiver<'ch, M, T> where M: RawMutex {}
+
+impl<'a, M: RawMutex, T> Receiver<'a, M, T> {
 
     /// Attempts to receive a value over the channel.
     pub fn try_receive(&mut self) -> Option<&mut T> {
