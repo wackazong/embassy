@@ -59,9 +59,22 @@ pio = "0.2.1"
 rand = { version = "0.8.5", default-features = false }
 embedded-sdmmc = "0.7.0"
 
+bt-hci = { version = "0.1.0", default-features = false, features = ["defmt"] }
+trouble-host = { version = "0.1.0", features = ["defmt"] }
+
 [profile.release]
 debug = 2
 
 [profile.dev]
 lto = true
 opt-level = "z"
+
+[patch.crates-io]
+trouble-host = { path = "/home/dirbaio/embassy/trouble/host"}
+bt-hci = { git = "https://github.com/alexmoon/bt-hci.git", branch = "main" }
+embassy-executor = { path = "../../embassy-executor" }
+embassy-sync = { path = "../../embassy-sync" }
+embassy-futures = { path = "../../embassy-futures" }
+embassy-time = { path = "../../embassy-time" }
+embassy-time-driver = { path = "../../embassy-time-driver" }
+embassy-embedded-hal = { path = "../../embassy-embedded-hal" }

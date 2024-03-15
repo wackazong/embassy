@@ -5,25 +5,38 @@
 #![no_std]
 #![no_main]
 
+use core::cell::RefCell;
+use core::future::Future;
+use core::ops::DerefMut;
+
+use bt_hci::cmd::{AsyncCmd, SyncCmd};
+use bt_hci::{
+    data, param, Controller, ControllerCmdAsync, ControllerCmdSync, ControllerToHostPacket, ReadHci, WithIndicator,
+    WriteHci,
+};
 use cyw43_pio::PioSpi;
-use defmt::*;
-use embassy_executor::Spawner;
+use defmt::{todo, *};
+use embassy_executor::{Executor, Spawner};
+use embassy_futures::join::join3;
+use embassy_futures::yield_now;
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Timer};
+use embedded_io_async::Read;
 use static_cell::StaticCell;
-use {defmt_rtt as _, panic_probe as _};
+use trouble_host::adapter::{Adapter, HostResources};
+use trouble_host::advertise::{AdStructure, AdvertiseConfig, BR_EDR_NOT_SUPPORTED, LE_GENERAL_DISCOVERABLE};
+use trouble_host::attribute::{AttributeTable, Characteristic, CharacteristicProp, Service, Uuid};
+use trouble_host::PacketQos;
+use {defmt_rtt as _, embassy_time as _, panic_probe as _};
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
 });
-
-#[embassy_executor::task]
-async fn wifi_task(runner: cyw43::Runner<'static, Output<'static>, PioSpi<'static, PIO0, 0, DMA_CH0>>) -> ! {
-    runner.run().await
-}
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -46,22 +59,17 @@ async fn main(spawner: Spawner) {
 
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
     let state = STATE.init(cyw43::State::new());
-    let (_net_device, mut control, runner) = cyw43::new_with_bluetooth(state, pwr, spi, fw, btfw).await;
-    unwrap!(spawner.spawn(wifi_task(runner)));
+    let (_net_device, mut control, mut runner) = cyw43::new_with_bluetooth(state, pwr, spi, fw, btfw).await;
+    //unwrap!(spawner.spawn(wifi_task(runner)));
+    //control.init(clm, false, true).await;
 
-    control.init(clm, false, true).await;
-    control
-        .set_power_management(cyw43::PowerManagementMode::PowerSave)
-        .await;
+    Timer::after_millis(1000).await;
 
-    let delay = Duration::from_secs(1);
-    loop {
-        info!("led on!");
-        control.gpio_set(0, true).await;
-        Timer::after(delay).await;
+    let mut buf = [0u8; 512];
+    let n = runner.hci_read(&mut buf).await;
+    info!("read: {:02x}", &buf[..n]);
 
-        info!("led off!");
-        control.gpio_set(0, false).await;
-        Timer::after(delay).await;
-    }
+    let pkt = &[0x01, 0x14, 0x0c, 0x00];
+    //let pkt = &[0x03, 0x00, 0x00, 0x01, 0x14, 0x0c, 0x00];
+    runner.hci_write(pkt).await;
 }

@@ -1,4 +1,5 @@
 use embassy_futures::select::{select3, Either3};
+use embassy_futures::yield_now;
 use embassy_net_driver_channel as ch;
 use embassy_time::{block_for, Duration, Timer};
 use embedded_hal_1::digital::OutputPin;
@@ -12,7 +13,7 @@ use crate::fmt::Bytes;
 use crate::ioctl::{IoctlState, IoctlType, PendingIoctl};
 use crate::nvram::NVRAM;
 use crate::structs::*;
-use crate::utilities::slice8_mut;
+use crate::utilities::{round_up, slice8_mut};
 use crate::{bluetooth, events, utilities, Core, CHIP, MTU};
 
 #[cfg(feature = "firmware-logs")]
@@ -51,10 +52,9 @@ pub struct Runner<'a, PWR, SPI> {
     log: LogState,
 
     // Bluetooth circular buffers
-    h2b_buf_addr: u32,
-    h2b_buf_addr_pointer: u32,
-    b2h_buf_addr: u32,
-    b2h_buf_addr_pointer: u32,
+    bt_addr: u32,
+    h2b_write_pointer: u32,
+    b2h_read_pointer: u32,
 }
 
 impl<'a, PWR, SPI> Runner<'a, PWR, SPI>
@@ -79,10 +79,9 @@ where
             #[cfg(feature = "firmware-logs")]
             log: LogState::default(),
 
-            h2b_buf_addr: 0,
-            h2b_buf_addr_pointer: 0,
-            b2h_buf_addr: 0,
-            b2h_buf_addr_pointer: 0,
+            bt_addr: 0,
+            h2b_write_pointer: 0,
+            b2h_read_pointer: 0,
         }
     }
 
@@ -214,6 +213,10 @@ where
         #[cfg(feature = "firmware-logs")]
         self.log_init().await;
 
+        if let Some(bluetooth_firmware) = bluetooth_firmware {
+            self.init_bluetooth(bluetooth_firmware).await;
+        }
+
         debug!("cyw43 runner init done");
     }
 
@@ -313,7 +316,7 @@ where
             let mut dest_start_addr = hfd.dest_addr + CHIP.bluetooth_base_address;
             let mut aligned_data_buffer_index: usize = 0;
             // pad start
-            if utilities::is_aligned(dest_start_addr, 4) {
+            if !utilities::is_aligned(dest_start_addr, 4) {
                 let num_pad_bytes = dest_start_addr % 4;
                 let padded_dest_start_addr = utilities::round_down(dest_start_addr, 4);
                 let memory_value = self.bus.bp_read32(padded_dest_start_addr).await;
@@ -441,19 +444,13 @@ where
 
     pub(crate) async fn init_bt_buffers(&mut self) {
         debug!("init_bt_buffers");
-        let wlan_ram_base_addr = self.bus.bp_read32(WLAN_RAM_BASE_REG_ADDR).await;
-        assert!(wlan_ram_base_addr != 0);
-        debug!("wlan_ram_base_addr = {:08x}", wlan_ram_base_addr);
-        self.h2b_buf_addr = wlan_ram_base_addr + BTSDIO_OFFSET_HOST_WRITE_BUF;
-        self.b2h_buf_addr = wlan_ram_base_addr + BTSDIO_OFFSET_HOST_READ_BUF;
-        let h2b_buf_in_addr = wlan_ram_base_addr + BTSDIO_OFFSET_HOST2BT_IN;
-        let h2b_buf_out_addr = wlan_ram_base_addr + BTSDIO_OFFSET_HOST2BT_OUT;
-        let b2h_buf_in_addr = wlan_ram_base_addr + BTSDIO_OFFSET_BT2HOST_IN;
-        let b2h_buf_out_addr = wlan_ram_base_addr + BTSDIO_OFFSET_BT2HOST_OUT;
-        self.bus.bp_write32(h2b_buf_in_addr, 0).await;
-        self.bus.bp_write32(h2b_buf_out_addr, 0).await;
-        self.bus.bp_write32(b2h_buf_in_addr, 0).await;
-        self.bus.bp_write32(b2h_buf_out_addr, 0).await;
+        self.bt_addr = self.bus.bp_read32(WLAN_RAM_BASE_REG_ADDR).await;
+        assert!(self.bt_addr != 0);
+        debug!("wlan_ram_base_addr = {:08x}", self.bt_addr);
+        self.bus.bp_write32(self.bt_addr + BTSDIO_OFFSET_HOST2BT_IN, 0).await;
+        self.bus.bp_write32(self.bt_addr + BTSDIO_OFFSET_HOST2BT_OUT, 0).await;
+        self.bus.bp_write32(self.bt_addr + BTSDIO_OFFSET_BT2HOST_IN, 0).await;
+        self.bus.bp_write32(self.bt_addr + BTSDIO_OFFSET_BT2HOST_OUT, 0).await;
     }
 
     async fn bt_bus_request(&mut self) {
@@ -466,29 +463,63 @@ where
         // TODO: CYW43_THREAD_EXIT mutex?
     }
 
-    #[allow(dead_code)]
-    pub(crate) async fn hci_read(&mut self, buf: &mut [u8]) -> u32 {
-        debug!("hci_read buf = {:02x}", buf);
-        self.bt_bus_request().await;
-        let mut header = [0 as u8; 4];
-        self.bus
-            .bp_read(self.b2h_buf_addr + self.b2h_buf_addr_pointer, &mut header)
-            .await;
-        self.b2h_buf_addr_pointer += header.len() as u32;
-        debug!("hci_read heaer = {:02x}", header);
-        // cybt_get_bt_buf_index(&fw_membuf_info);
-        // fw_b2h_buf_count = CIRC_BUF_CNT(fw_membuf_info.bt2host_in_val, fw_membuf_info.bt2host_out_val);
-        // cybt_mem_read_idx(B2H_BUF_ADDR_IDX, fw_membuf_info.bt2host_out_val, p_data, read_len);
-        // cybt_mem_read_idx(B2H_BUF_ADDR_IDX, 0, p_data + first_read_len, second_read_len);
-        // cybt_reg_write_idx(B2H_BUF_OUT_ADDR_IDX, new_b2h_out_val);
-        self.bt_toggle_intr().await;
-        let bytes_read = 0;
-        self.bt_bus_release().await;
-        return bytes_read;
+    pub async fn hci_ringbuf_debug(&mut self) {
+        let mut buf = [0u32; 4];
+        let mut buf8 = slice8_mut(&mut buf);
+        self.bus.bp_read(self.bt_addr + BTSDIO_OFFSET_HOST2BT_IN, buf8).await;
+
+        info!(
+            "HOST2BT IN={:08x} OUT={:08x} BT2HOST IN={:08x} OUT={:08x}",
+            buf[0], buf[1], buf[2], buf[3]
+        );
     }
 
-    #[allow(dead_code)]
-    pub(crate) async fn hci_write(&mut self, buf: &[u8]) {
+    async fn hci_read_ringbuf(&mut self, buf: &mut [u8]) {
+        assert!(buf.len() % 4 == 0);
+
+        loop {
+            let new_pointer = self.bus.bp_read32(self.bt_addr + BTSDIO_OFFSET_BT2HOST_IN).await;
+            let available = (self.b2h_read_pointer.wrapping_sub(new_pointer) % BTSDIO_FWBUF_SIZE) as usize;
+            if available >= buf.len() {
+                break;
+            }
+            yield_now().await;
+        }
+
+        // wraparound
+        if self.b2h_read_pointer as usize + buf.len() > BTSDIO_FWBUF_SIZE as usize {
+            let n = BTSDIO_FWBUF_SIZE - self.b2h_read_pointer;
+            let addr = self.bt_addr + BTSDIO_OFFSET_HOST_READ_BUF + self.b2h_read_pointer;
+            self.bus.bp_read(addr, &mut buf[..n as usize]).await;
+            let addr = self.bt_addr + BTSDIO_OFFSET_HOST_READ_BUF;
+            self.bus.bp_read(addr, &mut buf[n as usize..]).await;
+        } else {
+            let addr = self.bt_addr + BTSDIO_OFFSET_HOST_READ_BUF + self.b2h_read_pointer;
+            self.bus.bp_read(addr, buf).await;
+        }
+
+        self.b2h_read_pointer = (self.b2h_read_pointer + buf.len() as u32) % BTSDIO_FWBUF_SIZE;
+        self.bus
+            .bp_write32(self.bt_addr + BTSDIO_OFFSET_BT2HOST_OUT, self.b2h_read_pointer)
+            .await;
+    }
+
+    pub async fn hci_read(&mut self, buf: &mut [u8]) -> usize {
+        // read header
+        self.hci_read_ringbuf(&mut buf[..4]).await;
+
+        // calc length
+        let len = buf[0] as u32 | ((buf[1]) as u32) << 8 | ((buf[2]) as u32) << 16;
+        let rounded_len = round_up(len, 4);
+        self.hci_read_ringbuf(&mut buf[4..][..rounded_len as usize]).await;
+
+        self.bt_toggle_intr().await;
+        self.bt_bus_release().await;
+
+        4 + len as usize
+    }
+
+    pub async fn hci_write(&mut self, buf: &[u8]) {
         let buf_len = buf.len();
         let algined_buf_len = utilities::round_up((buf_len + 3) as u32, 4);
         assert!(buf_len <= algined_buf_len as usize);
@@ -500,19 +531,24 @@ where
         for i in 0..buf_len {
             buf_with_cmd[3 + i] = buf[i];
         }
-        let padded_buf_with_cmd = &buf_with_cmd[0..algined_buf_len as usize];
+        let padded_buf_with_cmd = &mut buf_with_cmd[0..algined_buf_len as usize];
         debug!("hci_write padded_buf_with_cmd = {:02x}", padded_buf_with_cmd);
         self.bt_bus_request().await;
+
+        let addr = self.bt_addr + BTSDIO_OFFSET_HOST_WRITE_BUF + self.h2b_write_pointer;
+        self.bus.bp_write(addr, &padded_buf_with_cmd).await;
+
+        self.h2b_write_pointer += padded_buf_with_cmd.len() as u32;
         self.bus
-            .bp_write(self.h2b_buf_addr + self.h2b_buf_addr_pointer, &padded_buf_with_cmd)
+            .bp_write32(self.bt_addr + BTSDIO_OFFSET_HOST2BT_IN, self.h2b_write_pointer)
             .await;
-        self.h2b_buf_addr_pointer += padded_buf_with_cmd.len() as u32;
+
         // TODO: handle wrapping based on BTSDIO_FWBUF_SIZE
         self.bt_toggle_intr().await;
         self.bt_bus_release().await;
     }
 
-    pub(crate) async fn bt_has_work(&mut self) -> bool {
+    pub async fn bt_has_work(&mut self) -> bool {
         let int_status = self.bus.bp_read32(CHIP.sdiod_core_base_address + SDIO_INT_STATUS).await;
         if int_status & I_HMB_FC_CHANGE != 0 {
             self.bus
